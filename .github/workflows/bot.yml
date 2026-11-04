@@ -11,8 +11,8 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  actions: write   # чтобы запустить следующий запуск
-  contents: read
+  actions: write    # чтобы запустить следующий запуск
+  contents: write   # чтобы сохранять state.db в ветку `state`
 
 jobs:
   run:
@@ -30,11 +30,9 @@ jobs:
       - run: pip install -r requirements-ci.txt
 
       - name: Restore state.db
-        uses: actions/cache/restore@v4
-        with:
-          path: state.db
-          key: state-${{ github.run_id }}
-          restore-keys: state-
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/state.sh pull
 
       - name: Queue the next run
         env:
@@ -49,12 +47,17 @@ jobs:
           COLLECTIONS: ${{ vars.COLLECTIONS }}
           RATE_LIMIT_PER_MIN: "105"
           PYTHONUNBUFFERED: "1"
-        # SIGINT = аккуратная остановка бота; затем сохраняем state.db
-        run: timeout --signal=SIGINT --kill-after=30 345m python bot.py || true
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # раз в час сохраняем state.db в ветку, чтобы авария раннера стоила максимум часа данных
+          ( while true; do sleep 3600; bash scripts/state.sh push || true; done ) &
+          SYNC=$!
+          # SIGINT = аккуратная остановка бота
+          timeout --signal=SIGINT --kill-after=30 345m python bot.py || true
+          kill "$SYNC" 2>/dev/null || true
 
       - name: Save state.db
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: state.db
-          key: state-${{ github.run_id }}
+        if: ${{ always() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/state.sh push
