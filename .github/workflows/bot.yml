@@ -47,6 +47,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           OPENSEA_API_KEY: ${{ secrets.OPENSEA_API_KEY }}
           COLLECTIONS: ${{ vars.COLLECTIONS }}
+          RATE_LIMIT_PER_MIN: "105"
           PYTHONUNBUFFERED: "1"
         # SIGINT = аккуратная остановка бота; затем сохраняем state.db
         run: timeout --signal=SIGINT --kill-after=30 345m python bot.py || true
