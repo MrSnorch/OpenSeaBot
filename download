@@ -1,0 +1,6 @@
+.env
+state.db
+*.log
+*.log.1
+.autostart_done
+__pycache__/
