@@ -356,6 +356,7 @@ SIGNAL_ALERT_SCORE = int(os.getenv("SIGNAL_ALERT_SCORE", "3"))
 SNIPE_DISCOUNT_PCT = float(os.getenv("SNIPE_DISCOUNT_PCT", "10"))
 SNIPE_PRICE = float(os.getenv("SNIPE_PRICE", "0")) or None
 NOTIFY_NEW_LISTINGS = os.getenv("NOTIFY_NEW_LISTINGS", "1") != "0"  # слать в Telegram и обычные новые листинги, не только снайпы
+SHOW_NICKNAMES = os.getenv("SHOW_NICKNAMES", "1") != "0"  # показывать ник кошелька на OpenSea (стоит по запросу на новый адрес)
 LISTING_GROUP_OVER = int(os.getenv("LISTING_GROUP_OVER", "5"))  # больше стольких за раз — одним сообщением
 LISTING_REPRICE_PCT = float(os.getenv("LISTING_REPRICE_PCT", "10"))  # уже известный токен: алерт, только если цена изменилась на столько %
 LISTING_MEMORY_SEC = int(os.getenv("LISTING_MEMORY_SEC", str(3 * 86400)))  # сколько помним цену токена (продлевается при каждом переоформлении)
@@ -404,6 +405,7 @@ db.executescript(
     create table if not exists sales(id text primary key, ts integer, price real, token text);
     """
 )
+db.execute("create table if not exists accounts(address text primary key, name text, ts integer)")
 db.execute("create table if not exists listed(slug text, token text, price real, ts integer, primary key(slug, token))")
 for _t in ("sales", "floor"):  # данные теперь по коллекциям; старые строки — к прежней коллекции
     try:
@@ -628,6 +630,37 @@ def esc(s):
     return html.escape(str(s))
 
 
+async def opensea_name(addr):
+    """Ник на OpenSea по адресу. '' — ника нет, None — узнать не вышло. Кэш в state.db (ник 7 дней, «нет ника» 1 день)."""
+    if not addr:
+        return None
+    a = addr.lower()
+    now = int(time.time())
+    row = db.execute("select name, ts from accounts where address=?", (a,)).fetchone()
+    if row and now - row[1] < (7 * 86400 if row[0] else 86400):
+        return row[0]
+    try:
+        d = await api.get(f"/accounts/{a}")
+        name = (d.get("username") or "").strip()
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code != 404:  # 404 = профиля нет; остальное — не кэшируем
+            return row[0] if row else None
+        name = ""
+    except Exception:
+        return row[0] if row else None
+    db.execute("insert or replace into accounts(address, name, ts) values(?, ?, ?)", (a, name, now))
+    db.commit()
+    return name
+
+
+async def wallet_label(addr):
+    """Ссылка на профиль: ник, а если ника нет — сокращённый адрес."""
+    if not addr:
+        return "?"
+    name = await opensea_name(addr) if SHOW_NICKNAMES else None
+    return f'<a href="https://opensea.io/{addr}">{esc(name) if name else esc(short(addr))}</a>'
+
+
 def money(p):
     return int(p["value"]) / 10 ** int(p["decimals"]), p.get("currency", "")
 
@@ -654,15 +687,16 @@ def parse_sale(ev, slug):
 
 def parse_listing(l, slug):
     price, sym = money(l["price"]["current"])
-    tid, contract = "?", ""
+    tid, contract, seller = "?", "", None
     try:
         off = l["protocol_data"]["parameters"]["offer"][0]
         tid, contract = off["identifierOrCriteria"], off["token"]
+        seller = l["protocol_data"]["parameters"].get("offerer")
     except Exception:
         pass
     chain = l.get("chain", "ethereum")
     url = f"https://opensea.io/assets/{chain}/{contract}/{tid}" if contract else coll_url(slug)
-    return {"id": l["order_hash"], "price": price, "sym": sym, "token": tid, "url": url}
+    return {"id": l["order_hash"], "price": price, "sym": sym, "token": tid, "url": url, "seller": seller}
 
 
 def parse_offer(o):
@@ -789,13 +823,13 @@ def signal_text(sig):
 
 
 # ───────────────────────── тексты алертов ─────────────────────────
-def sale_text(s, floor):
+def sale_text(s, floor, seller_lbl=None, buyer_lbl=None):
     prem = f" ({(s['price'] / floor - 1) * 100:+.0f}% к флору)" if floor else ""
     return (
         f"💸 <b>Продажа {esc(s['name'])}</b>\n"
         f"Цена: <b>{fmt(s['price'])} {esc(s['sym'])}</b>{usd(s['price'], s['sym'])}{prem}\n"
         + (f"Флор: <b>{fmt(floor)} {esc(s['sym'])}</b>{usd(floor, s['sym'])}\n" if floor else "")
-        + f"{short(s['seller'])} → {short(s['buyer'])}\n"
+        + f"{seller_lbl or esc(short(s['seller']))} → {buyer_lbl or esc(short(s['buyer']))}\n"
         f"<a href=\"{s['url']}\">OpenSea</a>"
     )
 
@@ -806,6 +840,7 @@ def snipe_text(l, floor):
         f"🎯 <b>СНАЙП: #{esc(l['token'])}</b>\n"
         f"Цена: <b>{fmt(l['price'])} {esc(l['sym'])}</b>{usd(l['price'], l['sym'])}{d}\n"
         + (f"Флор: <b>{fmt(floor)} {esc(l['sym'])}</b>{usd(floor, l['sym'])}\n" if floor else "")
+        + (f"Продавец: {l['seller_lbl']}\n" if l.get("seller_lbl") else "")
         + f"<a href=\"{l['url']}\">Купить на OpenSea</a>"
     )
 
@@ -824,6 +859,7 @@ def new_listing_text(l, floor, prev_price=None):
     return (
         head + "\n" + price
         + (f"Флор: <b>{fmt(floor)} {esc(l['sym'])}</b>{usd(floor, l['sym'])}\n" if floor else "")
+        + (f"Продавец: {l['seller_lbl']}\n" if l.get("seller_lbl") else "")
         + f"<a href=\"{l['url']}\">Открыть на OpenSea</a>"
     )
 
@@ -902,7 +938,7 @@ async def check_sales(ctx, slug):
             + (f"\nФлор: {fmt(floor)} {esc(new[0]['sym'])}{usd(floor, new[0]['sym'])}" if floor else "")), slug)
     else:
         for s in new:
-            await notify(ctx, sale_text(s, floor), slug)
+            await notify(ctx, sale_text(s, floor, await wallet_label(s["seller"]), await wallet_label(s["buyer"])), slug)
     if new:
         ckv_set(slug, "last_sale_ts", max(s["ts"] for s in new))
 
@@ -935,6 +971,7 @@ async def check_listings(ctx, slug):
     items = filter_fresh(slug, fresh, is_snipe)
     for l, prev, snipe in items:
         if snipe:
+            l["seller_lbl"] = await wallet_label(l.get("seller"))
             await notify(ctx, snipe_text(l, prev_floor), slug)
     rest = [(l, prev) for l, prev, snipe in items if not snipe]
     if NOTIFY_NEW_LISTINGS and rest:
@@ -946,6 +983,7 @@ async def check_listings(ctx, slug):
             await notify(ctx, f"🆕 <b>{len(rest)} новых листингов и изменений цены</b>\nСамые дешёвые:\n{lines}", slug)
         else:
             for l, prev in rest:
+                l["seller_lbl"] = await wallet_label(l.get("seller"))
                 await notify(ctx, new_listing_text(l, prev_floor, prev), slug)
     if first_run:
         ckv_set(slug, "listings_init", 1)
