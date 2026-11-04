@@ -351,10 +351,13 @@ OS_KEY = os.environ["OPENSEA_API_KEY"]
 LEGACY_SLUG = _default_slug()  # коллекция, к которой относятся старые данные в state.db
 POLL = float(os.getenv("POLL_SECONDS", "1.0"))  # листинги (снайп): ~60 запросов/мин
 SALES_POLL = float(os.getenv("SALES_POLL_SECONDS", "1.7"))  # продажи: ~35 запросов/мин
-RATE_LIMIT = int(os.getenv("RATE_LIMIT_PER_MIN", "100"))  # жёсткий потолок запросов к OpenSea в минуту
+RATE_LIMIT = int(os.getenv("RATE_LIMIT_PER_MIN", "90"))  # жёсткий потолок запросов к OpenSea в минуту
 SIGNAL_ALERT_SCORE = int(os.getenv("SIGNAL_ALERT_SCORE", "3"))
 SNIPE_DISCOUNT_PCT = float(os.getenv("SNIPE_DISCOUNT_PCT", "10"))
 SNIPE_PRICE = float(os.getenv("SNIPE_PRICE", "0")) or None
+NOTIFY_NEW_LISTINGS = os.getenv("NOTIFY_NEW_LISTINGS", "1") != "0"  # слать в Telegram и обычные новые листинги, не только снайпы
+LISTING_GROUP_OVER = int(os.getenv("LISTING_GROUP_OVER", "5"))  # больше стольких за раз — одним сообщением
+LISTING_DEDUP_SEC = int(os.getenv("LISTING_DEDUP_SEC", "21600"))  # тот же токен по той же цене не повторять 6 ч
 FLOOR_ALERT_PCT = float(os.getenv("FLOOR_ALERT_PCT", "5"))
 COOLDOWN_FLOOR = int(os.getenv("COOLDOWN_FLOOR_S", "300"))    # мин. пауза между алертами про флор
 COOLDOWN_SIGNAL = int(os.getenv("COOLDOWN_SIGNAL_S", "1800"))  # мин. пауза между алертами «окно продажи»
@@ -803,6 +806,30 @@ def snipe_text(l, floor):
     )
 
 
+def new_listing_text(l, floor):
+    d = f" ({(l['price'] / floor - 1) * 100:+.0f}% к флору)" if floor else ""
+    return (
+        f"🆕 <b>Новый листинг #{esc(l['token'])}</b>\n"
+        f"Цена: <b>{fmt(l['price'])} {esc(l['sym'])}</b>{usd(l['price'], l['sym'])}{d}\n"
+        + (f"Флор: <b>{fmt(floor)} {esc(l['sym'])}</b>{usd(floor, l['sym'])}\n" if floor else "")
+        + f"<a href=\"{l['url']}\">Открыть на OpenSea</a>"
+    )
+
+
+_listing_sent = {}  # (slug, токен, цена) -> когда уже слали; гасит повторы, когда продавец переставляет ордер
+
+
+def _listing_dup(slug, l):
+    now = time.time()
+    for k in [k for k, t in _listing_sent.items() if now - t > LISTING_DEDUP_SEC]:
+        del _listing_sent[k]
+    key = (slug, l["token"], round(l["price"], 8))
+    if key in _listing_sent:
+        return True
+    _listing_sent[key] = now
+    return False
+
+
 def evt(msg, slug=None):
     """Строка для трея: что бот делает прямо сейчас."""
     if slug and len(SLUGS) > 1:
@@ -852,20 +879,32 @@ async def check_listings(ctx, slug):
     first_run = ckv_get(slug, "listings_init") is None
     prev_floor = ckv_float(slug, "floor")
     snipe_abs, disc = SNIPE_PRICE, SNIPE_DISCOUNT_PCT
+    fresh = []
     for l in ls:
         if is_seen("listing", l["id"]):
             continue
         mark_seen("listing", l["id"])
-        if first_run:
-            continue
-        hit = (snipe_abs is not None and l["price"] <= snipe_abs) or (
-            prev_floor and l["price"] <= prev_floor * (1 - disc / 100)
-        )
-        if hit:
-            await notify(ctx, snipe_text(l, prev_floor), slug)
+        if not first_run:
+            fresh.append(l)
+    for l in fresh:
+        d = f" ({(l['price'] / prev_floor - 1) * 100:+.0f}% к флору)" if prev_floor else ""
+        evt(f"новый листинг #{l['token']} — {fmt(l['price'])} {l['sym']}{d}", slug)
+    fresh = [l for l in fresh if not _listing_dup(slug, l)]
+    snipes = [l for l in fresh
+              if (snipe_abs is not None and l["price"] <= snipe_abs)
+              or (prev_floor and l["price"] <= prev_floor * (1 - disc / 100))]
+    for l in snipes:
+        await notify(ctx, snipe_text(l, prev_floor), slug)
+    rest = [l for l in fresh if l not in snipes]
+    if NOTIFY_NEW_LISTINGS and rest:
+        if len(rest) > LISTING_GROUP_OVER:
+            top = sorted(rest, key=lambda x: x["price"])[:LISTING_GROUP_OVER]
+            lines = "\n".join(
+                f"• <a href=\"{x['url']}\">#{esc(x['token'])}</a> — {fmt(x['price'])} {esc(x['sym'])}" for x in top)
+            await notify(ctx, f"🆕 <b>{len(rest)} новых листингов</b>\nСамые дешёвые:\n{lines}", slug)
         else:
-            d = f" ({(l['price'] / prev_floor - 1) * 100:+.0f}% к флору)" if prev_floor else ""
-            evt(f"новый листинг #{l['token']} — {fmt(l['price'])} {l['sym']}{d}", slug)
+            for l in rest:
+                await notify(ctx, new_listing_text(l, prev_floor), slug)
     if first_run:
         ckv_set(slug, "listings_init", 1)
 
