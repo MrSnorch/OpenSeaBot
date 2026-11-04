@@ -357,7 +357,8 @@ SNIPE_DISCOUNT_PCT = float(os.getenv("SNIPE_DISCOUNT_PCT", "10"))
 SNIPE_PRICE = float(os.getenv("SNIPE_PRICE", "0")) or None
 NOTIFY_NEW_LISTINGS = os.getenv("NOTIFY_NEW_LISTINGS", "1") != "0"  # слать в Telegram и обычные новые листинги, не только снайпы
 LISTING_GROUP_OVER = int(os.getenv("LISTING_GROUP_OVER", "5"))  # больше стольких за раз — одним сообщением
-LISTING_DEDUP_SEC = int(os.getenv("LISTING_DEDUP_SEC", "21600"))  # тот же токен по той же цене не повторять 6 ч
+LISTING_REPRICE_PCT = float(os.getenv("LISTING_REPRICE_PCT", "10"))  # уже известный токен: алерт, только если цена изменилась на столько %
+LISTING_MEMORY_SEC = int(os.getenv("LISTING_MEMORY_SEC", str(3 * 86400)))  # сколько помним цену токена (продлевается при каждом переоформлении)
 FLOOR_ALERT_PCT = float(os.getenv("FLOOR_ALERT_PCT", "5"))
 COOLDOWN_FLOOR = int(os.getenv("COOLDOWN_FLOOR_S", "300"))    # мин. пауза между алертами про флор
 COOLDOWN_SIGNAL = int(os.getenv("COOLDOWN_SIGNAL_S", "1800"))  # мин. пауза между алертами «окно продажи»
@@ -390,6 +391,7 @@ if "--worker" in sys.argv:
     _h.setFormatter(logging.Formatter(_FMT))
     reqlog.addHandler(_h)
 logging.getLogger("apscheduler").setLevel(logging.WARNING)  # без шума «Running job…»
+logging.getLogger("apscheduler.executors.default").setLevel(logging.ERROR)  # «skipped: maximum number of running instances» — не авария
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ───────────────────────── storage ─────────────────────────
@@ -402,6 +404,7 @@ db.executescript(
     create table if not exists sales(id text primary key, ts integer, price real, token text);
     """
 )
+db.execute("create table if not exists listed(slug text, token text, price real, ts integer, primary key(slug, token))")
 for _t in ("sales", "floor"):  # данные теперь по коллекциям; старые строки — к прежней коллекции
     try:
         db.execute(f"alter table {_t} add column slug text")
@@ -494,6 +497,7 @@ def maintenance():
     kv_set("maint_ts", now)
     db.execute("delete from seen where ts < ?", (now - 14 * 86400,))
     db.execute("delete from sales where ts < ?", (now - 30 * 86400,))
+    db.execute("delete from listed where ts < ?", (now - 30 * 86400,))
     db.commit()
 
 
@@ -806,28 +810,59 @@ def snipe_text(l, floor):
     )
 
 
-def new_listing_text(l, floor):
+def new_listing_text(l, floor, prev_price=None):
     d = f" ({(l['price'] / floor - 1) * 100:+.0f}% к флору)" if floor else ""
+    if prev_price:
+        d = ""
+        ch = (l["price"] / prev_price - 1) * 100
+        head = f"{'🔻 Цена снижена' if ch < 0 else '🔺 Цена повышена'} #{esc(l['token'])}"
+        price = (f"Было: {fmt(prev_price)} → <b>{fmt(l['price'])} {esc(l['sym'])}</b>"
+                 f"{usd(l['price'], l['sym'])} ({ch:+.0f}%){d}\n")
+    else:
+        head = f"🆕 <b>Новый листинг #{esc(l['token'])}</b>"
+        price = f"Цена: <b>{fmt(l['price'])} {esc(l['sym'])}</b>{usd(l['price'], l['sym'])}{d}\n"
     return (
-        f"🆕 <b>Новый листинг #{esc(l['token'])}</b>\n"
-        f"Цена: <b>{fmt(l['price'])} {esc(l['sym'])}</b>{usd(l['price'], l['sym'])}{d}\n"
+        head + "\n" + price
         + (f"Флор: <b>{fmt(floor)} {esc(l['sym'])}</b>{usd(floor, l['sym'])}\n" if floor else "")
         + f"<a href=\"{l['url']}\">Открыть на OpenSea</a>"
     )
 
 
-_listing_sent = {}  # (slug, токен, цена) -> когда уже слали; гасит повторы, когда продавец переставляет ордер
+def listed_seed(slug, ls):
+    """Запомнить текущие листинги как известные (без алертов)."""
+    now = int(time.time())
+    db.executemany("insert or ignore into listed(slug, token, price, ts) values(?, ?, ?, ?)",
+                   [(slug, l["token"], l["price"], now) for l in ls if l["token"] != "?"])
+    db.commit()
 
 
-def _listing_dup(slug, l):
-    now = time.time()
-    for k in [k for k, t in _listing_sent.items() if now - t > LISTING_DEDUP_SEC]:
-        del _listing_sent[k]
-    key = (slug, l["token"], round(l["price"], 8))
-    if key in _listing_sent:
-        return True
-    _listing_sent[key] = now
-    return False
+def filter_fresh(slug, fresh, is_snipe):
+    """Из «новых ордеров» оставляем только то, о чём стоит говорить.
+    Токен, который уже был выставлен, молчит, пока цена не изменилась на LISTING_REPRICE_PCT %
+    (продавцы постоянно переоформляют ордер с чуть другой ценой). Снайпы пропускаем при изменении от 1 %.
+    Возвращает [(листинг, прежняя_цена | None, снайп?)]."""
+    now = int(time.time())
+    out, done = [], set()
+    for l in fresh:  # fresh отсортирован по цене: у токена с несколькими ордерами берём дешёвый
+        tok = l["token"]
+        if tok in done:
+            continue
+        done.add(tok)
+        snipe = is_snipe(l)
+        prev = None
+        if tok != "?":
+            row = db.execute("select price, ts from listed where slug=? and token=?", (slug, tok)).fetchone()
+            if row and now - row[1] <= LISTING_MEMORY_SEC:
+                prev = row[0]
+                change = abs(l["price"] / prev - 1) * 100 if prev else 100.0
+                if change < (1.0 if snipe else LISTING_REPRICE_PCT):
+                    db.execute("update listed set ts=? where slug=? and token=?", (now, slug, tok))
+                    continue
+            db.execute("insert or replace into listed(slug, token, price, ts) values(?, ?, ?, ?)",
+                       (slug, tok, l["price"], now))
+        out.append((l, prev, snipe))
+    db.commit()
+    return out
 
 
 def evt(msg, slug=None):
@@ -888,23 +923,30 @@ async def check_listings(ctx, slug):
             fresh.append(l)
     for l in fresh:
         d = f" ({(l['price'] / prev_floor - 1) * 100:+.0f}% к флору)" if prev_floor else ""
-        evt(f"новый листинг #{l['token']} — {fmt(l['price'])} {l['sym']}{d}", slug)
-    fresh = [l for l in fresh if not _listing_dup(slug, l)]
-    snipes = [l for l in fresh
-              if (snipe_abs is not None and l["price"] <= snipe_abs)
-              or (prev_floor and l["price"] <= prev_floor * (1 - disc / 100))]
-    for l in snipes:
-        await notify(ctx, snipe_text(l, prev_floor), slug)
-    rest = [l for l in fresh if l not in snipes]
+        evt(f"новый ордер #{l['token']} — {fmt(l['price'])} {l['sym']}{d}", slug)
+    if first_run or db.execute("select 1 from listed where slug=? limit 1", (slug,)).fetchone() is None:
+        listed_seed(slug, ls)  # первый запуск (или после обновления): текущие листинги считаем известными
+        fresh = []
+
+    def is_snipe(l):
+        return (snipe_abs is not None and l["price"] <= snipe_abs) or bool(
+            prev_floor and l["price"] <= prev_floor * (1 - disc / 100))
+
+    items = filter_fresh(slug, fresh, is_snipe)
+    for l, prev, snipe in items:
+        if snipe:
+            await notify(ctx, snipe_text(l, prev_floor), slug)
+    rest = [(l, prev) for l, prev, snipe in items if not snipe]
     if NOTIFY_NEW_LISTINGS and rest:
         if len(rest) > LISTING_GROUP_OVER:
-            top = sorted(rest, key=lambda x: x["price"])[:LISTING_GROUP_OVER]
+            top = sorted(rest, key=lambda x: x[0]["price"])[:LISTING_GROUP_OVER]
             lines = "\n".join(
-                f"• <a href=\"{x['url']}\">#{esc(x['token'])}</a> — {fmt(x['price'])} {esc(x['sym'])}" for x in top)
-            await notify(ctx, f"🆕 <b>{len(rest)} новых листингов</b>\nСамые дешёвые:\n{lines}", slug)
+                f"• <a href=\"{x['url']}\">#{esc(x['token'])}</a> — {fmt(x['price'])} {esc(x['sym'])}"
+                for x, _ in top)
+            await notify(ctx, f"🆕 <b>{len(rest)} новых листингов и изменений цены</b>\nСамые дешёвые:\n{lines}", slug)
         else:
-            for l in rest:
-                await notify(ctx, new_listing_text(l, prev_floor), slug)
+            for l, prev in rest:
+                await notify(ctx, new_listing_text(l, prev_floor, prev), slug)
     if first_run:
         ckv_set(slug, "listings_init", 1)
 
@@ -991,13 +1033,18 @@ async def on_start(app: Application):
 def main():
     app = Application.builder().token(TOKEN).post_init(on_start).build()
     jq = app.job_queue  # независимые задачи на каждую коллекцию, запросы идут вразнобой, а не пачкой
-    n = len(SLUGS)  # общий лимит запросов делим на все коллекции: интервалы растут пропорционально
+    n = len(SLUGS)
+    # Опрос листингов и продаж берёт не больше ~75% лимита — остальное на stats/офферы/повторы.
+    # Если выбранные POLL/SALES_POLL на n коллекций дают больше, интервалы растягиваются поровну.
+    want = 60 / POLL + 60 / SALES_POLL  # суммарно по всем коллекциям: интервал на коллекцию = poll * n
+    k = max(1.0, want / (RATE_LIMIT * 0.75))
+    poll, sales_poll = POLL * k, SALES_POLL * k
     for i, slug in enumerate(SLUGS):
-        jq.run_repeating(_safe(check_listings), interval=POLL * n, first=2 + i * POLL, data=slug)
-        jq.run_repeating(_safe(check_sales), interval=SALES_POLL * n, first=4 + i * SALES_POLL, data=slug)
+        jq.run_repeating(_safe(check_listings), interval=poll * n, first=2 + i * poll, data=slug)
+        jq.run_repeating(_safe(check_sales), interval=sales_poll * n, first=4 + i * sales_poll, data=slug)
         jq.run_repeating(_safe(check_signal), interval=60, first=15 + i * 7, data=slug)
     jq.run_repeating(_safe(update_rate, per_collection=False), interval=60, first=1)
-    evt("слежу за: " + ", ".join(SLUGS))
+    evt(f"слежу за: {', '.join(SLUGS)} · листинги раз в {poll * n:.1f}с, продажи раз в {sales_poll * n:.1f}с на коллекцию")
     app.run_polling()
 
 
