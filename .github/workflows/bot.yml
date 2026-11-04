@@ -1,0 +1,59 @@
+name: bot
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "7 * * * *"   # страховка: если цепочка запусков оборвалась, раз в час поднимет бота снова
+
+# Только один запуск за раз; следующий ждёт в очереди, пока текущий не закончится
+concurrency:
+  group: bot
+  cancel-in-progress: false
+
+permissions:
+  actions: write   # чтобы запустить следующий запуск
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355   # лимит GitHub на джобу — 360 минут
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-ci.txt
+
+      - run: pip install -r requirements-ci.txt
+
+      - name: Restore state.db
+        uses: actions/cache/restore@v4
+        with:
+          path: state.db
+          key: state-${{ github.run_id }}
+          restore-keys: state-
+
+      - name: Queue the next run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run bot.yml --ref "${{ github.ref_name }}"
+
+      - name: Run bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          OPENSEA_API_KEY: ${{ secrets.OPENSEA_API_KEY }}
+          COLLECTIONS: ${{ vars.COLLECTIONS }}
+          PYTHONUNBUFFERED: "1"
+        # SIGINT = аккуратная остановка бота; затем сохраняем state.db
+        run: timeout --signal=SIGINT --kill-after=30 345m python bot.py || true
+
+      - name: Save state.db
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.db
+          key: state-${{ github.run_id }}
