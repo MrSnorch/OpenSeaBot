@@ -357,6 +357,7 @@ SNIPE_DISCOUNT_PCT = float(os.getenv("SNIPE_DISCOUNT_PCT", "10"))
 SNIPE_PRICE = float(os.getenv("SNIPE_PRICE", "0")) or None
 NOTIFY_NEW_LISTINGS = os.getenv("NOTIFY_NEW_LISTINGS", "1") != "0"  # слать в Telegram и обычные новые листинги, не только снайпы
 SHOW_NICKNAMES = os.getenv("SHOW_NICKNAMES", "1") != "0"  # показывать ник кошелька на OpenSea (стоит по запросу на новый адрес)
+LISTING_MAX_OVER_FLOOR_PCT = float(os.getenv("LISTING_MAX_OVER_FLOOR_PCT", "0"))  # новые листинги дороже флора на больше чем столько % не присылаем (0 = только на уровне флора и ниже)
 LISTING_GROUP_OVER = int(os.getenv("LISTING_GROUP_OVER", "5"))  # больше стольких за раз — одним сообщением
 LISTING_REPRICE_PCT = float(os.getenv("LISTING_REPRICE_PCT", "10"))  # уже известный токен: алерт, только если цена изменилась на столько %
 LISTING_MEMORY_SEC = int(os.getenv("LISTING_MEMORY_SEC", str(3 * 86400)))  # сколько помним цену токена (продлевается при каждом переоформлении)
@@ -973,7 +974,9 @@ async def check_listings(ctx, slug):
         if snipe:
             l["seller_lbl"] = await wallet_label(l.get("seller"))
             await notify(ctx, snipe_text(l, prev_floor), slug)
-    rest = [(l, prev) for l, prev, snipe in items if not snipe]
+    cap = prev_floor * (1 + LISTING_MAX_OVER_FLOOR_PCT / 100) + 1e-12 if prev_floor else None
+    rest = [(l, prev) for l, prev, snipe in items
+            if not snipe and (cap is None or l["price"] <= cap)]  # выше флора — не интересно
     if NOTIFY_NEW_LISTINGS and rest:
         if len(rest) > LISTING_GROUP_OVER:
             top = sorted(rest, key=lambda x: x[0]["price"])[:LISTING_GROUP_OVER]
