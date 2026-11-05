@@ -852,7 +852,7 @@ def new_listing_text(l, floor, prev_price=None):
         d = ""
         ch = (l["price"] / prev_price - 1) * 100
         head = f"{'🔻 Цена снижена' if ch < 0 else '🔺 Цена повышена'} #{esc(l['token'])}"
-        price = (f"Было: {fmt(prev_price)} → <b>{fmt(l['price'])} {esc(l['sym'])}</b>"
+        price = (f"Было: {fmt(prev_price)} {esc(l['sym'])}{usd(prev_price, l['sym'])} → <b>{fmt(l['price'])} {esc(l['sym'])}</b>"
                  f"{usd(l['price'], l['sym'])} ({ch:+.0f}%){d}\n")
     else:
         head = f"🆕 <b>Новый листинг #{esc(l['token'])}</b>"
