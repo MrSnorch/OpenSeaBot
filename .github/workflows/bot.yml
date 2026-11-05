@@ -48,9 +48,10 @@ jobs:
           RATE_LIMIT_PER_MIN: "105"
           PYTHONUNBUFFERED: "1"
           GH_TOKEN: ${{ github.token }}
+          STATE_SAVE_EVERY: "600"   # секунд между сохранениями state.db в ветку
         run: |
-          # раз в час сохраняем state.db в ветку, чтобы авария раннера стоила максимум часа данных
-          ( while true; do sleep 3600; bash scripts/state.sh push || true; done ) &
+          # периодически сохраняем state.db в ветку, чтобы авария раннера стоила максимум 10 минут данных
+          ( while true; do sleep "$STATE_SAVE_EVERY"; bash scripts/state.sh push || true; done ) &
           SYNC=$!
           # SIGINT = аккуратная остановка бота
           timeout --signal=SIGINT --kill-after=30 345m python bot.py || true
